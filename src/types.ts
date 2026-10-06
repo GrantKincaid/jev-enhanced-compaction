@@ -60,7 +60,7 @@ export interface CallDecision extends CallAnswer {
   id: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
+  reason: 'pinned' | 'guarded' | 'kept' | 'result_dropped' | 'call_dropped';
 }
 
 export interface HistoryToolCall {
@@ -105,6 +105,10 @@ export interface CompactOptions {
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /** `tool_use_id`s that must stay verbatim whatever Jev answers (the compact-partial keep list). */
+  keepToolUseIds?: readonly string[];
+  /** compact-partial digest: inserted after the first message and shown to Jev as context. */
+  digest?: string;
 }
 
 export interface ResolvedCompactOptions {
@@ -130,6 +134,7 @@ export interface CompactResult {
     resultsDropped: number;
     callsDropped: number;
     pinned: number;
+    guarded: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;
