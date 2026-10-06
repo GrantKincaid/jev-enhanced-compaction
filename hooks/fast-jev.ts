@@ -9,6 +9,8 @@ import type {
 } from 'claude-code';
 
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { collectToolCalls } from '../src/state.js';
+import { compactPartial, type PartialAsker, type PartialResult } from '../src/partial.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
   CompactOptions,
@@ -166,10 +168,57 @@ export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  partial?: PartialResult,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const options: CompactOptions = partial
+    ? { ...config, digest: partial.digest, keepToolUseIds: partial.keep }
+    : config;
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), options);
   return { result, messages: toSessionMessages(messages, result.messages) };
+}
+
+/** A `PartialAsker` over `$.model.fork`: the session's own model, sharing its prompt cache. */
+export function forkAsker(fork: (request: { prompt: string }) => Promise<unknown>): PartialAsker {
+  return {
+    async ask(prompt) {
+      const reply = await fork({ prompt });
+      if (!reply) throw new Error('session fork unavailable (cold cache or API error)');
+      if (typeof reply === 'string') return reply;
+      const text = (reply as { text?: unknown }).text;
+      if (typeof text === 'string') return text;
+      const shape = typeof reply === 'object' ? Object.keys(reply).join(',') || 'empty object' : typeof reply;
+      throw new Error(`session fork returned no text (${shape})`);
+    },
+  };
+}
+
+/**
+ * compact-partial: one fork pass over the session transcript, before Jev.
+ * Throws when the fork is unavailable or its reply is unusable.
+ */
+export function runPartial(
+  messages: readonly SessionMessage[],
+  config: HookConfig,
+  asker: PartialAsker,
+  instructions?: string,
+): Promise<PartialResult> {
+  const calls = collectToolCalls(messages, resolveOptions(config).preserveRecentMessages);
+  const options: { preserveRecentMessages: number; instructions?: string } = {
+    preserveRecentMessages: resolveOptions(config).preserveRecentMessages,
+  };
+  if (instructions) options.instructions = instructions;
+  return compactPartial(asker, calls, options);
+}
+
+/** Debug switch: `"fastJev": { "debugSkipPartial": true }` in any settings.json. */
+export function partialDisabled(settings: Readonly<Record<string, unknown>>): boolean {
+  const section = settings['fastJev'];
+  return (
+    !!section &&
+    typeof section === 'object' &&
+    (section as Record<string, unknown>)['debugSkipPartial'] === true
+  );
 }
 
 function percent(ratio: number): string {
@@ -182,6 +231,7 @@ export function summarize(result: CompactResult): string {
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
+    stats.guarded > 0 ? `${stats.guarded} guarded` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
@@ -256,17 +306,116 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+/** The slash command that runs compact-partial + Jev on demand; `/compact` is left alone. */
+export const COMPACT_JEV_COMMAND = 'compact-jev';
+
+const COMPACT_RETRY_MS = 500;
+const COMPACT_MAX_TRIES = 20;
+
+/** Set while the plugin itself runs a built-in `/compact`, so the hook knows it is ours. */
+const jevRun = { pending: false };
+
+type CompactRequester = {
+  command: { run: (args: { command: string; args?: string }) => Promise<unknown> };
+  session: { compact: (args: { instructions?: string }) => Promise<{ skip?: string | undefined }> };
+};
+
+/**
+ * Compacts through Jev. `$.session.compact` is not offered in headless (-p / SDK,
+ * desktop app) sessions, where compaction only runs inside a `/compact` prompt;
+ * there the plugin runs `/compact` itself and marks it as its own.
+ */
+export async function requestCompact($: CompactRequester, instructions: string): Promise<{ skip?: string | undefined }> {
+  try {
+    return await $.session.compact(instructions ? { instructions } : {});
+  } catch (error) {
+    if (!/headless/i.test(error instanceof Error ? error.message : String(error))) throw error;
+  }
+  jevRun.pending = true;
+  try {
+    await $.command.run({ command: 'compact', ...(instructions ? { args: instructions } : {}) });
+    return {};
+  } finally {
+    jevRun.pending = false;
+  }
+}
+
+type CompactScheduler = CompactRequester & {
+  clock: { after: (ms: number, fn: () => void) => unknown };
+  ui: {
+    log: (text: string) => void;
+    toast: (text: string, options?: { timeoutMs?: number }) => void;
+  };
+};
+
+/** Runs `$.session.compact` shortly after the calling hook returns, retrying while a turn is still running. */
+export function scheduleCompact($: CompactScheduler, instructions: string): void {
+  let tries = 0;
+  const attempt = async (): Promise<void> => {
+    try {
+      const { skip } = await requestCompact($, instructions);
+      if (skip) notify($, `compaction skipped: ${skip}`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (/turn/i.test(message) && ++tries < COMPACT_MAX_TRIES) {
+        $.clock.after(COMPACT_RETRY_MS, () => void attempt());
+        return;
+      }
+      notify($, `/${COMPACT_JEV_COMMAND} failed (${message})`);
+    }
+  };
+  $.clock.after(COMPACT_RETRY_MS, () => void attempt());
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
 
+  on('session.start', async ($, event, next) => {
+    try {
+      await $.command.register({
+        name: COMPACT_JEV_COMMAND,
+        description: 'Compact the conversation with compact-partial and Jev (/compact stays the built-in)',
+        argumentHint: '[what to keep or stress]',
+      });
+    } catch (error) {
+      $.ui.log(
+        `/${COMPACT_JEV_COMMAND} not registered (${error instanceof Error ? error.message : String(error)})`,
+      );
+    }
+    return next(event);
+  });
+
+  on('command.run', { command: COMPACT_JEV_COMMAND }, ($, event) => {
+    // The host refuses session.compact from inside a command.run turn, so the
+    // compaction is scheduled to run once the command's turn has ended.
+    scheduleCompact($, event.args.trim());
+    return { text: `/${COMPACT_JEV_COMMAND}: compacting as soon as the session is idle` };
+  });
+
   on('session.compact', async ($, event, next) => {
+    // The person's /compact stays Claude Code's own; /compact-jev, the plugin's
+    // threshold check and the engine's auto compaction come through here.
+    if (event.trigger === 'manual' && !jevRun.pending) return next(event);
     try {
       const config = { ...configured, apiKey: await getApiKey($, configured) };
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      let partial: PartialResult | undefined;
+      if (!partialDisabled(await $.settings.read())) {
+        // The fork reads the main conversation, so a subagent's own transcript
+        // cannot be digested: it takes the standard compaction.
+        if (event.agentId) throw new Error('compact-partial does not cover subagent transcripts');
+        partial = await runPartial(event.messages, config, forkAsker((r) => $.model.fork(r)), event.instructions);
+        $.ui.log(`compact-partial: digest ${partial.digest.length} chars, ${partial.keep.length} calls guarded`);
+      } else $.ui.log('compact-partial skipped (fastJev.debugSkipPartial)');
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        partial,
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -295,7 +444,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const { context } = await $.session.usage();
       if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
       compacting = true;
-      await $.session.compact();
+      await requestCompact($, '');
     } catch (error) {
       $.ui.log(
         `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,

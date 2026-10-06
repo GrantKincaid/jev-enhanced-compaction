@@ -56,6 +56,18 @@ built-in compaction summary with the original messages.
 Jev failures, malformed answers, a missing key, or a history that cannot be
 fitted throw; the caller (or the Claude Code hook) decides what to fall back to.
 
+## compact-partial (plugin)
+
+Before Jev runs, the hook asks the session's own model, through `$.model.fork`
+(same model, shared prompt cache, no tools), for a JSON reply: a `digest` of
+what must not be lost and a `keep` list of tool-call ids. The digest is shown to
+Jev as context and inserted as a message right after the first message; keep-list
+calls stay verbatim whatever Jev answers (reported as `guarded`). `/compact-jev`
+instructions are included in the fork prompt. If the fork is unavailable, its
+reply is unusable, or the compaction is a subagent's, the hook falls back to
+Claude Code's standard compaction. For debugging only, set
+`"fastJev": { "debugSkipPartial": true }` in any settings.json.
+
 ## Install and usage
 
 ```sh
@@ -146,14 +158,15 @@ Then add this repository as a plugin marketplace and install the plugin,
 either from the shell or as slash commands inside a session:
 
 ```sh
-claude plugin marketplace add tamaratran/fast-jev-compaction
+claude plugin marketplace add GrantKincaid/jev-enhanced-compaction
 claude plugin install fast-jev-compaction@fast-jev-compaction
 ```
 
 The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
 …); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
-Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
-auto-compaction) goes through Jev: the toast reads
+Restart Claude Code or run `/reload-plugins`. From then on `/compact-jev`, the plugin's
+threshold compaction and the engine's auto-compaction go through compact-partial
+and Jev, while `/compact` stays Claude Code's built-in: the toast reads
 `fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
 replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
 could not remove enough (short sessions, or when it fails).

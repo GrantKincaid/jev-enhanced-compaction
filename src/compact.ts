@@ -1,5 +1,6 @@
 import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { digestMessage, MAX_DIGEST_CHARS } from './partial.js';
+import { collectToolCalls, estimateTokens, fitState, goalFromMessages } from './state.js';
 import type {
   CallAnswer,
   CallDecision,
@@ -99,12 +100,13 @@ export function batchCalls(
 }
 
 export function decideCall(
-  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
+  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'> & { guarded?: boolean },
   answer: CallAnswer,
   options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
 ): CallDecision {
   const base = { id: call.id, tool: call.tool, ...answer };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
+  if (call.guarded) return { ...base, action: 'keep', reason: 'guarded' };
   if (answer.keepResult >= options.keepThreshold) {
     return { ...base, action: 'keep', reason: 'kept' };
   }
@@ -261,8 +263,18 @@ export async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
+  const digest = options.digest?.trim() ?? '';
+  if (digest) {
+    const goal = resolved.goal || goalFromMessages(messages);
+    resolved.goal = `${goal}
+
+Essential details already flagged (keep what supports them):
+${digest.slice(0, MAX_DIGEST_CHARS)}`;
+  }
+  const guardedIds = new Set(options.keepToolUseIds ?? []);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
-  const candidates = calls.filter((call) => !call.pinned);
+  // Guarded calls are never sent to Jev: the keep list is strict.
+  const candidates = calls.filter((call) => !call.pinned && !guardedIds.has(call.tool_use_id));
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
@@ -279,14 +291,16 @@ export async function compact(
   }
 
   const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+    decideCall(
+      { ...call, guarded: guardedIds.has(call.tool_use_id) },
+      answers.get(call.id) ?? { keepCall: 1, keepResult: 1 },
+      resolved,
+    ),
   );
-  const kept = applyDecisions(
-    messages,
-    decisions,
-    calls,
-    resolved.truncateHeadChars,
-  );
+  const applied = applyDecisions(messages, decisions, calls, resolved.truncateHeadChars);
+  const kept = digest
+    ? [...applied.slice(0, 1), digestMessage(digest), ...applied.slice(1)]
+    : applied;
   return {
     messages: kept,
     decisions,
@@ -300,6 +314,7 @@ export async function compact(
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
+      guarded: count(decisions, 'guarded'),
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
