@@ -68,6 +68,17 @@ reply is unusable, or the compaction is a subagent's, the hook falls back to
 Claude Code's standard compaction. For debugging only, set
 `"fastJev": { "debugSkipPartial": true }` in any settings.json.
 
+### Memory save before `/compact-jev`
+
+`/compact-jev` first sends the model a prompt (default: "Prepare for compaction:
+follow your instructions for persistent memory and save your state now…") so work
+that is not yet in its memory files gets written down. The plugin waits for that
+turn to finish, then compacts, so the saved state is in the history Jev sees. If
+the turn is interrupted the compaction is cancelled; if the prompt cannot be
+sent it compacts anyway. Change the text with the `prepareCompactionPrompt`
+plugin option, or set it to a single space to skip the step. The plugin's own
+threshold trigger does not send it.
+
 ## Install and usage
 
 ```sh

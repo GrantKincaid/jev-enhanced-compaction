@@ -74,13 +74,13 @@ describe('compact-partial', () => {
 });
 
 describe('/compact-jev', () => {
-  async function setup() {
+  async function setup(options: Record<string, unknown> = {}) {
     const { register } = await import('../hooks/fast-jev.ts');
     const handlers: Record<string, (...args: any[]) => any> = {};
     (register as any)((name: string, a: unknown, b?: unknown) => {
       const key = typeof a === 'function' ? name : `${name}:${(a as any).command}`;
       handlers[key] = (typeof a === 'function' ? a : b) as any;
-    }, {});
+    }, options);
     return handlers;
   }
 
@@ -97,7 +97,7 @@ describe('/compact-jev', () => {
   });
 
   it('schedules the compaction after the command returns, retrying while a turn runs', async () => {
-    const h = await setup();
+    const h = await setup({ prepareCompactionPrompt: ' ' }); // memory-save step off
     const timers: (() => void)[] = [];
     const calls: unknown[] = [];
     let busy = 1;
@@ -121,6 +121,65 @@ describe('/compact-jev', () => {
     timers.shift()!();
     await new Promise((r) => setTimeout(r, 0));
     expect(calls).toEqual([{ instructions: 'the plan' }, { instructions: 'the plan' }]);
+  });
+
+  it('saves memory first: submits the prompt, waits for its turn to end, then compacts', async () => {
+    const { DEFAULT_PREPARE_PROMPT } = await import('../hooks/fast-jev.ts');
+    const h = await setup();
+    const timers: (() => void)[] = [];
+    const order: string[] = [];
+    const $ = {
+      clock: { after: (_ms: number, fn: () => void) => timers.push(fn) },
+      ui: { log: () => {}, toast: () => {} },
+      prompt: { submit: async ({ text }: { text: string }) => (order.push(`submit:${text === DEFAULT_PREPARE_PROMPT}`), {}) },
+      session: { compact: async (a: unknown) => (order.push(`compact:${JSON.stringify(a)}`), {}) },
+    };
+    const next = async (e: unknown) => e;
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+    const out = await h['command.run:compact-jev']!($, { args: 'the plan' });
+    expect(out.text).toContain('save its state');
+    timers.shift()!();
+    await flush();
+    expect(order).toEqual(['submit:true']); // not compacting yet
+    // an unrelated turn finishing does not trigger it
+    await h['turn.complete']!({ ...$, session: { ...$.session, usage: async () => ({ context: { percent: 1 } }) } }, { turnId: 'other', reason: 'answer' }, next);
+    expect(timers).toHaveLength(0);
+    await h['turn.start']!($, { text: DEFAULT_PREPARE_PROMPT, turnId: 't1' }, next);
+    await h['turn.complete']!($, { turnId: 't1', reason: 'answer' }, next);
+    timers.shift()!();
+    await flush();
+    expect(order).toEqual(['submit:true', 'compact:{"instructions":"the plan"}']);
+  });
+
+  it('cancels the compaction when the memory-save turn is interrupted, and compacts anyway if the prompt cannot be sent', async () => {
+    const h = await setup();
+    const timers: (() => void)[] = [];
+    const toasts: string[] = [];
+    const compacts: unknown[] = [];
+    const base = {
+      clock: { after: (_ms: number, fn: () => void) => timers.push(fn) },
+      ui: { log: () => {}, toast: (t: string) => toasts.push(t) },
+      session: { compact: async (a: unknown) => (compacts.push(a), {}) },
+    };
+    const next = async (e: unknown) => e;
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+    const $ = { ...base, prompt: { submit: async () => ({}) } };
+    await h['command.run:compact-jev']!($, { args: '' });
+    timers.shift()!();
+    await flush();
+    await h['turn.start']!($, { text: (await import('../hooks/fast-jev.ts')).DEFAULT_PREPARE_PROMPT, turnId: 't1' }, next);
+    await h['turn.complete']!($, { turnId: 't1', reason: 'aborted' }, next);
+    expect(timers).toHaveLength(0);
+    expect(toasts.join()).toContain('cancelled');
+
+    const broken = { ...base, prompt: { submit: async () => ({ drop: 'refused' }) } };
+    await h['command.run:compact-jev']!(broken, { args: '' });
+    timers.shift()!();
+    await flush();
+    timers.shift()!();
+    await flush();
+    expect(compacts).toEqual([{}]);
+    expect(toasts.join()).toContain('compacting anyway');
   });
 
   it('falls back to a plugin-run /compact in headless sessions and marks it as its own', async () => {

@@ -367,9 +367,31 @@ export function scheduleCompact($: CompactScheduler, instructions: string): void
   $.clock.after(COMPACT_RETRY_MS, () => void attempt());
 }
 
+export const DEFAULT_PREPARE_PROMPT =
+  'Prepare for compaction: follow your instructions for persistent memory and save your state now ' +
+  '(decisions, progress, open work, anything not yet written down). Reply with one line when done.';
+
+/** The prompt sent before `/compact-jev` compacts; an empty option value turns the step off. */
+export function resolvePreparePrompt(options: PluginOptions): string {
+  const value = options['prepareCompactionPrompt'];
+  return typeof value === 'string' ? value.trim() : DEFAULT_PREPARE_PROMPT;
+}
+
+type PendingPrepare = {
+  instructions: string;
+  prompt: string;
+  /** The id of the model turn that is answering the prepare prompt, once it starts. */
+  turnId?: string;
+};
+
+type PromptSubmitter = CompactScheduler & {
+  prompt: { submit: (input: { text: string }) => Promise<{ drop?: string | undefined }> };
+};
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  let pending: PendingPrepare | undefined;
 
   on('session.start', async ($, event, next) => {
     try {
@@ -387,10 +409,33 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('command.run', { command: COMPACT_JEV_COMMAND }, ($, event) => {
-    // The host refuses session.compact from inside a command.run turn, so the
-    // compaction is scheduled to run once the command's turn has ended.
-    scheduleCompact($, event.args.trim());
-    return { text: `/${COMPACT_JEV_COMMAND}: compacting as soon as the session is idle` };
+    // The host refuses session.compact and prompt.submit from inside a
+    // command.run turn, so both are scheduled to run after the command returns.
+    const instructions = event.args.trim();
+    const prompt = resolvePreparePrompt(options);
+    if (!prompt) {
+      scheduleCompact($, instructions);
+      return { text: `/${COMPACT_JEV_COMMAND}: compacting as soon as the session is idle` };
+    }
+    pending = { instructions, prompt };
+    const submit = async (): Promise<void> => {
+      try {
+        const sent = await ($ as unknown as PromptSubmitter).prompt.submit({ text: prompt });
+        if (!sent.drop) return;
+        throw new Error(sent.drop);
+      } catch (error) {
+        pending = undefined;
+        notify($, `memory-save prompt not sent (${error instanceof Error ? error.message : String(error)}); compacting anyway`);
+        scheduleCompact($, instructions);
+      }
+    };
+    $.clock.after(COMPACT_RETRY_MS, () => void submit());
+    return { text: `/${COMPACT_JEV_COMMAND}: asking the model to save its state, then compacting` };
+  });
+
+  on('turn.start', ($, event, next) => {
+    if (pending && !pending.turnId && event.text === pending.prompt) pending.turnId = event.turnId;
+    return next(event);
   });
 
   on('session.compact', async ($, event, next) => {
@@ -439,6 +484,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
+    if (pending?.turnId && pending.turnId === event.turnId) {
+      // The memory-save turn is over: compact now, unless it was cut short.
+      const { instructions } = pending;
+      pending = undefined;
+      if (event.reason === 'answer') scheduleCompact($, instructions);
+      else notify($, `/${COMPACT_JEV_COMMAND} cancelled: the memory-save turn ended early (${event.reason})`);
+      return next(event);
+    }
     if (compacting) return next(event);
     try {
       const { context } = await $.session.usage();

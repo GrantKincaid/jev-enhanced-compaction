@@ -57,6 +57,12 @@
       "title": "Jev model",
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
+    },
+    "prepareCompactionPrompt": {
+      "type": "string",
+      "title": "Pre-compaction prompt",
+      "description": "Prompt sent to the chat before /compact-jev compacts, so the model saves its persistent memory first. Leave unset for the default; set to a single space to skip the step.",
+      "default": "Prepare for compaction: follow your instructions for persistent memory and save your state now (decisions, progress, open work, anything not yet written down). Reply with one line when done."
     }
   }
 }
