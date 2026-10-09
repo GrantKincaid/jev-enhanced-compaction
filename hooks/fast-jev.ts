@@ -311,6 +311,7 @@ export const COMPACT_JEV_COMMAND = 'compact-jev';
 
 const COMPACT_RETRY_MS = 500;
 const COMPACT_MAX_TRIES = 20;
+const PREPARE_TURN_TIMEOUT_MS = 60_000;
 
 /** Set while the plugin itself runs a built-in `/compact`, so the hook knows it is ours. */
 const jevRun = { pending: false };
@@ -368,8 +369,8 @@ export function scheduleCompact($: CompactScheduler, instructions: string): void
 }
 
 export const DEFAULT_PREPARE_PROMPT =
-  'Prepare for compaction: follow your instructions for persistent memory and save your state now ' +
-  '(decisions, progress, open work, anything not yet written down). Reply with one line when done.';
+  'Context is about to be compacted. Update the memory files for this project now with the current task status, ' +
+  'key facts and next steps, following the memory conventions for this project. Reply with one line when done.';
 
 /** The prompt sent before `/compact-jev` compacts; an empty option value turns the step off. */
 export function resolvePreparePrompt(options: PluginOptions): string {
@@ -417,12 +418,19 @@ export const register: Register = (on: On, options: PluginOptions) => {
       scheduleCompact($, instructions);
       return { text: `/${COMPACT_JEV_COMMAND}: compacting as soon as the session is idle` };
     }
-    pending = { instructions, prompt };
+    const mine: PendingPrepare = { instructions, prompt };
+    pending = mine;
     const submit = async (): Promise<void> => {
       try {
         const sent = await ($ as unknown as PromptSubmitter).prompt.submit({ text: prompt });
-        if (!sent.drop) return;
-        throw new Error(sent.drop);
+        if (sent.drop) throw new Error(sent.drop);
+        // Never leave the compaction waiting on a turn that was not recognised.
+        $.clock.after(PREPARE_TURN_TIMEOUT_MS, () => {
+          if (pending !== mine || mine.turnId) return;
+          pending = undefined;
+          notify($, 'memory-save turn not detected; compacting anyway');
+          scheduleCompact($, instructions);
+        });
       } catch (error) {
         pending = undefined;
         notify($, `memory-save prompt not sent (${error instanceof Error ? error.message : String(error)}); compacting anyway`);
@@ -434,7 +442,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
   });
 
   on('turn.start', ($, event, next) => {
-    if (pending && !pending.turnId && event.text === pending.prompt) pending.turnId = event.turnId;
+    // The host frames a plugin's prompt ("The <plugin> plugin sent a message: …"), so match by containment.
+    if (pending && !pending.turnId && event.text.includes(pending.prompt)) pending.turnId = event.turnId;
     return next(event);
   });
 

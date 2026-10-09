@@ -24,10 +24,13 @@ console.log(`${steps.length} tool calls, roughly ${approxTokens} tokens of tool 
 console.log('1. Start a session with that directory as its working directory (plugin installed).');
 console.log('2. Send this as your first message:\n');
 console.log(`   ${openingMessage(seed)} Then read TASK.md and follow it exactly.\n`);
-console.log('3. When it replies "READY FOR /compact-jev", run /compact-jev.');
+console.log('3. When it replies "READY FOR /compact-jev", run /compact-jev. The plugin should first send the');
+console.log('   memory-save prompt; the model then writes memory/state.md (rule in the workspace CLAUDE.md), and');
+console.log('   only after that turn ends does the compaction run.');
 console.log('4. Then send this message:\n');
 console.log('   Answer from memory only: do not read files or run commands. Just write');
 console.log('   answers.json (a JSON object, one string value per id):\n');
 console.log(quizText().replace(/^/gm, '   ') + '\n');
 console.log(`5. node tests/session-memory/verify.mjs score "${outDir}"`);
+console.log('   (score also checks memory/state.md: the memory-save prompt was sent and executed)');
 console.log(`   node tests/session-memory/verify.mjs transcript "${outDir}"`);

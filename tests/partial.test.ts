@@ -141,14 +141,44 @@ describe('/compact-jev', () => {
     timers.shift()!();
     await flush();
     expect(order).toEqual(['submit:true']); // not compacting yet
+    const watchdog = timers.shift()!; // armed after a successful submit
     // an unrelated turn finishing does not trigger it
     await h['turn.complete']!({ ...$, session: { ...$.session, usage: async () => ({ context: { percent: 1 } }) } }, { turnId: 'other', reason: 'answer' }, next);
     expect(timers).toHaveLength(0);
-    await h['turn.start']!($, { text: DEFAULT_PREPARE_PROMPT, turnId: 't1' }, next);
+    await h['turn.start']!($, { text: `The fast-jev-compaction plugin sent a message:
+${DEFAULT_PREPARE_PROMPT}
+
+This is how Claude Code surfaces a prompt a plugin submits.`, turnId: 't1' }, next);
     await h['turn.complete']!($, { turnId: 't1', reason: 'answer' }, next);
     timers.shift()!();
     await flush();
     expect(order).toEqual(['submit:true', 'compact:{"instructions":"the plan"}']);
+    watchdog(); // the turn was recognised, so the watchdog does nothing
+    await flush();
+    expect(timers).toHaveLength(0);
+  });
+
+  it('compacts anyway when the memory-save turn is never recognised', async () => {
+    const h = await setup();
+    const timers: (() => void)[] = [];
+    const toasts: string[] = [];
+    const compacts: unknown[] = [];
+    const $ = {
+      clock: { after: (_ms: number, fn: () => void) => timers.push(fn) },
+      ui: { log: () => {}, toast: (t: string) => toasts.push(t) },
+      prompt: { submit: async () => ({}) },
+      session: { compact: async (a: unknown) => (compacts.push(a), {}) },
+    };
+    const flush = () => new Promise((r) => setTimeout(r, 0));
+    await h['command.run:compact-jev']!($, { args: '' });
+    timers.shift()!(); // submit
+    await flush();
+    timers.shift()!(); // watchdog fires: no turn.start ever matched
+    await flush();
+    timers.shift()!(); // the scheduled compaction
+    await flush();
+    expect(toasts.join()).toContain('not detected');
+    expect(compacts).toEqual([{}]);
   });
 
   it('cancels the compaction when the memory-save turn is interrupted, and compacts anyway if the prompt cannot be sent', async () => {
@@ -168,6 +198,7 @@ describe('/compact-jev', () => {
     timers.shift()!();
     await flush();
     await h['turn.start']!($, { text: (await import('../hooks/fast-jev.ts')).DEFAULT_PREPARE_PROMPT, turnId: 't1' }, next);
+    timers.length = 0; // drop the watchdog
     await h['turn.complete']!($, { turnId: 't1', reason: 'aborted' }, next);
     expect(timers).toHaveLength(0);
     expect(toasts.join()).toContain('cancelled');

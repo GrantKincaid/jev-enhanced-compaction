@@ -3,7 +3,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { DIGEST_HEADER, NOISE_TAG, facts, score } from './lib.mjs';
+import { DIGEST_HEADER, NOISE_TAG, PREPARE_MARKER, facts, score, scoreMemory } from './lib.mjs';
 
 const [mode, dirArg, ...rest] = process.argv.slice(2);
 if (!['score', 'transcript'].includes(mode) || !dirArg) {
@@ -23,10 +23,15 @@ if (mode === 'score') {
   for (const r of rows) {
     console.log(`${r.pass ? 'PASS' : 'FAIL'}  ${r.category.padEnd(8)} ${r.id.padEnd(7)} expected=${r.expected} got=${r.got}`);
   }
+  const stateFile = join(outDir, 'memory', 'state.md');
+  const memory = scoreMemory(existsSync(stateFile) ? readFileSync(stateFile, 'utf8') : null, seed);
+  for (const r of memory) console.log(`${r.pass ? 'PASS' : 'FAIL'}  memory   ${r.id.padEnd(7)} expected=${r.expected}`);
+  const memoryOk = memory.every((r) => r.pass);
   console.log(
     ok ? `CORE OK${allOk ? ' (stretch too)' : ' (stretch failed: the needle survived neither verbatim nor in the digest)'}` : 'CORE FAILED',
   );
-  process.exit(ok ? 0 : 1);
+  console.log(memoryOk ? 'MEMORY SAVE OK (the pre-compaction prompt was sent and executed)' : 'MEMORY SAVE FAILED (memory/state.md missing or incomplete)');
+  process.exit(ok && memoryOk ? 0 : 1);
 }
 
 function newestTranscript() {
@@ -57,7 +62,12 @@ const after = lines.slice(digestAt).join('\n');
 const f = facts(seed);
 const count = (s, needle) => s.split(needle).length - 1;
 const digestLine = lines[digestAt];
+// the pre-compaction prompt: sent (in the transcript) and executed (a write to memory/state.md after it)
+const promptAt = lines.findIndex((l) => l.includes(PREPARE_MARKER) && !l.includes('"name":"Write"'));
+const wroteAfter = promptAt >= 0 && lines.slice(promptAt + 1).some((l) => /state\.md/.test(l) && /"(Write|Edit)"|"name":"(Write|Edit)"/.test(l));
 const checks = [
+  ['memory-save prompt sent', promptAt >= 0],
+  ['memory-save prompt executed (state.md written after it)', wroteAfter],
   ['digest message present', true],
   ['core facts still present after the digest', [f.port, f.errorBlock].every((v) => after.includes(v))],
   ['late (pinned) code present', after.includes(f.lateCode)],

@@ -1,10 +1,12 @@
 // Deterministic fixtures and quiz for the manual /compact-jev session test.
 // The expected answers are derived from the seed, never written into the workspace.
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 export const DEFAULT_SEED = 'jev-memory-1';
 export const NOISE_TAG = 'FJNOISE';
+/** Start of the default pre-compaction prompt the plugin sends. */
+export const PREPARE_MARKER = 'Context is about to be compacted';
 export const DIGEST_HEADER = '[fast-jev-compaction digest of earlier context]';
 
 function rng(seed) {
@@ -38,6 +40,7 @@ export function facts(seed = DEFAULT_SEED) {
     errorBlock: `0x${hex(6).toUpperCase()}`, // failing command output
     rotatedKeyId: `KEY-${pick().toUpperCase()}-${num(1000, 9999)}`, // needle in a long log
     lateCode: `LATE-${hex(5).toUpperCase()}`, // read last, inside the pinned messages
+    saveToken: `SAVE-${hex(6).toUpperCase()}`, // proves the memory-save prompt was executed
     needleLine: num(180, 260),
   };
 }
@@ -80,7 +83,24 @@ export function generate(outDir, { seed = DEFAULT_SEED, noiseCount = 12, noiseCh
   const f = facts(seed);
   for (const d of ['config', 'logs', 'scripts']) mkdirSync(join(outDir, d), { recursive: true });
   const put = (p, text) => writeFileSync(join(outDir, p), text);
+  // start clean: results of an earlier run must not satisfy this one
+  rmSync(join(outDir, 'answers.json'), { force: true });
+  rmSync(join(outDir, 'memory'), { recursive: true, force: true });
   put('.seed', seed);
+  put(
+    'CLAUDE.md',
+    [
+      '# Persistent memory',
+      '',
+      'Keep persistent memory in `memory/state.md`. Do not touch it during normal work.',
+      'Only when you are told that context is about to be compacted:',
+      'create or overwrite `memory/state.md` with',
+      `1. the line \`memory-save: ${f.saveToken}\``,
+      '2. the ports, ids, error codes, limits and branch names that appeared in tool output or messages so far, one per line',
+      'then reply with one short line.',
+      '',
+    ].join('\n'),
+  );
   put('scripts/show.mjs', "import { readFileSync } from 'node:fs';\nprocess.stdout.write(readFileSync(process.argv[2], 'utf8'));\n");
   put('config/service.json', JSON.stringify({ service: 'ledger', port: Number(f.port), retryLimit: Number(f.retryLimit), region: 'eu-west-2' }, null, 2) + '\n');
   put(
@@ -109,7 +129,7 @@ export function generate(outDir, { seed = DEFAULT_SEED, noiseCount = 12, noiseCh
       '',
       'Run each command below, one per tool call, in order, from this directory.',
       'Do not batch calls, do not summarize outputs, and do not re-read anything later.',
-      'After each call reply with just "ok". Do not edit any file.',
+      'After each call reply with just "ok". Do not edit any file (the memory rule in CLAUDE.md applies only when told that context is about to be compacted).',
       '',
       ...steps.map((s, i) => `${i + 1}. \`${s}\``),
       '',
@@ -122,6 +142,18 @@ export function generate(outDir, { seed = DEFAULT_SEED, noiseCount = 12, noiseCh
 
 export function quizText() {
   return QUIZ.map((q, i) => `${i + 1}. [${q.id}] ${q.ask}`).join('\n');
+}
+
+/** Scores memory/state.md (text, or null when missing): written by the pre-compaction prompt. */
+export function scoreMemory(text, seed = DEFAULT_SEED) {
+  const f = facts(seed);
+  const has = (v) => typeof text === 'string' && text.includes(v);
+  return [
+    { id: 'file', pass: text !== null && text !== undefined, expected: 'memory/state.md written' },
+    { id: 'token', pass: has(f.saveToken), expected: f.saveToken },
+    { id: 'port', pass: has(f.port), expected: f.port },
+    { id: 'block', pass: has(f.errorBlock), expected: f.errorBlock },
+  ].map((r) => ({ ...r, category: 'memory' }));
 }
 
 const norm = (v) => String(v ?? '').trim().toLowerCase();

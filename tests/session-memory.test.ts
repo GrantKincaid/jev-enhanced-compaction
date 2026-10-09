@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 // @ts-expect-error plain .mjs harness
-import { QUIZ, facts, generate, score } from './session-memory/lib.mjs';
+import { QUIZ, facts, generate, score, scoreMemory } from './session-memory/lib.mjs';
 
 describe('session memory harness', () => {
   it('derives the same facts per seed and plants them in the workspace', () => {
@@ -27,5 +27,19 @@ describe('session memory harness', () => {
     expect(score(all, 'a')).toMatchObject({ ok: true, allOk: true });
     expect(score({ ...all, needle: 'x' }, 'a')).toMatchObject({ ok: true, allOk: false });
     expect(score({ ...all, port: '1' }, 'a')).toMatchObject({ ok: false });
+  });
+
+  it('plants the memory rule and scores the saved state', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'jevmem-'));
+    generate(dir, { seed: 'a', noiseCount: 1, noiseChars: 500 });
+    const f = facts('a');
+    expect(readFileSync(join(dir, 'CLAUDE.md'), 'utf8')).toContain(f.saveToken);
+    const good = `memory-save: ${f.saveToken}
+${f.port}
+${f.errorBlock}
+`;
+    expect(scoreMemory(good, 'a').every((r: { pass: boolean }) => r.pass)).toBe(true);
+    expect(scoreMemory(null, 'a').every((r: { pass: boolean }) => r.pass)).toBe(false);
+    expect(scoreMemory('memory-save: nope', 'a').filter((r: { pass: boolean }) => r.pass)).toHaveLength(1);
   });
 });
